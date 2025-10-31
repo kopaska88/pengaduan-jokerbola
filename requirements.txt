@@ -1,5 +1,6 @@
-python-telegram-bot==21.5
-gspread
+python-telegram-bot[job-queue]==21.5
+gspread==6.1.4
 google-auth
 pytz
 httpx
+python-dotenv
