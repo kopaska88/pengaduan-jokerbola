@@ -1,0 +1,1 @@
+worker: python pengaduan_bot.py
