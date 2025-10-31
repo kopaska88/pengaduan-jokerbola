@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
 GOOGLE_SHEET_NAME = "Pengaduan Global"
-ADMIN_IDS = [5704050846, 8388423519]
+ADMIN_IDS = [5704050846, 8388423519, 5048153064]
 
 # Timezone Jakarta
 JAKARTA_TZ = pytz.timezone('Asia/Jakarta')
