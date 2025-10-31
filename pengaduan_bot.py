@@ -80,14 +80,16 @@ def escape_html(text):
     return ''.join(escape_chars.get(char, char) for char in str(text))
 
 def main_menu_keyboard():
+    """Keyboard menu utama dengan tombol MENU di sebelah kiri"""
     return ReplyKeyboardMarkup([
         ['📝 Buat Pengaduan', '🔍 Cek Status'],
-        ['ℹ️ Bantuan']
+        ['ℹ️ Bantuan', 'MENU']
     ], resize_keyboard=True)
 
 def cancel_keyboard():
+    """Keyboard untuk pembatalan dengan tombol MENU"""
     return ReplyKeyboardMarkup([
-        ['❌ Batalkan']
+        ['❌ Batalkan', 'MENU']
     ], resize_keyboard=True)
 
 # ===== STATE MANAGEMENT =====
@@ -123,6 +125,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Selamat datang di Layanan Pengaduan</b>\n\n"
         "Kami siap untuk melayani pengaduan anda.\n\n"
         "Silakan pilih menu di bawah:",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
+    )
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk tombol MENU - kembali ke menu utama"""
+    user_id = update.message.from_user.id
+    clear_user_state(user_id)
+    
+    await update.message.reply_text(
+        "📱 <b>Menu Utama</b>\n\n"
+        "Silakan pilih opsi yang Anda butuhkan:",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
@@ -189,7 +203,8 @@ async def handle_bantuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 <b>Tips:</b>\n"
         "• Simpan nomor tiket dengan baik\n"
         "• Bisa buat pengaduan berkali-kali\n\n"
-        "❌ <b>Batalkan proses kapan saja</b> dengan klik '❌ Batalkan'",
+        "❌ <b>Batalkan proses kapan saja</b> dengan klik '❌ Batalkan'\n"
+        "📱 <b>Kembali ke menu utama</b> dengan klik 'MENU'",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
@@ -213,6 +228,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_state = get_user_state(user_id)
     logger.info(f"User {user_id} message: {user_message}, state: {user_state}")
+    
+    # Handle MENU terlebih dahulu (selalu kembali ke menu utama)
+    if user_message == "MENU":
+        await handle_menu(update, context)
+        return
     
     # Handle cancel terlebih dahulu
     if user_message.lower() == "❌ batalkan":
@@ -614,10 +634,12 @@ def main():
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("cancel", cancel_command))
         application.add_handler(CommandHandler("help", handle_bantuan))
+        application.add_handler(CommandHandler("menu", handle_menu))
         
         application.add_handler(MessageHandler(filters.Text(["📝 Buat Pengaduan"]), handle_buat_pengaduan))
         application.add_handler(MessageHandler(filters.Text(["🔍 Cek Status"]), handle_cek_status))
         application.add_handler(MessageHandler(filters.Text(["ℹ️ Bantuan"]), handle_bantuan))
+        application.add_handler(MessageHandler(filters.Text(["MENU"]), handle_menu))
         application.add_handler(MessageHandler(filters.Text(["❌ Batalkan"]), handle_cancel))
         
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
