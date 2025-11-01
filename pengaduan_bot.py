@@ -5,7 +5,7 @@ import logging
 import pytz
 import asyncio
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
     filters
@@ -22,12 +22,12 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
 GOOGLE_SHEET_NAME = "Pengaduan Global"
-ADMIN_IDS = [5704050846, 8388423519, 5048153064]
+ADMIN_IDS = [5704050846, 8388423519]
 
 # Timezone Jakarta
 JAKARTA_TZ = pytz.timezone('Asia/Jakarta')
 
-# Website configuration dengan kode yang FIXED
+# Website configuration - HANYA INI YANG DITERIMA
 WEBSITES = {
     'jokerbola': {'code': 'JB', 'name': 'JokerBola'},
     'nagabola': {'code': 'NB', 'name': 'NagaBola'}, 
@@ -46,13 +46,35 @@ except Exception as e:
     logger.error(f"❌ Google Sheets connection failed: {e}")
     worksheet = None
 
+# ===== KEYBOARD SETUP =====
+def get_main_menu_keyboard():
+    """Keyboard untuk menu utama"""
+    keyboard = [
+        [KeyboardButton("📝 Buat Pengaduan Baru"), KeyboardButton("🔍 Cek Status Tiket")],
+        [KeyboardButton("ℹ️ Cara Penggunaan"), KeyboardButton("🆘 Bantuan")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Pilih menu...")
+
+def get_cancel_only_keyboard():
+    """Keyboard dengan hanya tombol cancel"""
+    keyboard = [[KeyboardButton("❌ Batalkan Proses")]]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Ketik pesan Anda...")
+
+def get_skip_photo_keyboard():
+    """Keyboard untuk skip foto"""
+    keyboard = [
+        [KeyboardButton("📸 Kirim Foto Bukti"), KeyboardButton("⏩ Lewati Tanpa Foto")],
+        [KeyboardButton("❌ Batalkan Proses")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Pilih opsi...")
+
 # Helper functions
 def get_jakarta_time():
     """Dapatkan waktu Jakarta sekarang"""
     return datetime.now(JAKARTA_TZ).strftime("%d/%m/%Y %H:%M:%S")
 
 def generate_ticket_number(website_code):
-    """Generate ticket number dengan format: CODE-DDMMYYYY-NOMOR"""
+    """Generate ticket number berdasarkan kode website"""
     try:
         all_data = worksheet.get_all_records()
         today = datetime.now(JAKARTA_TZ).strftime("%d%m%Y")  # DDMMYYYY
@@ -65,6 +87,20 @@ def generate_ticket_number(website_code):
     except Exception as e:
         logger.error(f"Error generating ticket: {e}")
         return f"{website_code}-{datetime.now(JAKARTA_TZ).strftime('%d%m%Y')}-001"
+
+def validate_website_input(user_input):
+    """Validasi input website customer - HARUS SESUAI KRITERIA"""
+    user_input_lower = user_input.lower().strip()
+    
+    # Cek apakah input user cocok dengan website yang ada
+    for key, info in WEBSITES.items():
+        if (key in user_input_lower or 
+            info['name'].lower() in user_input_lower or
+            user_input_lower in key or 
+            user_input_lower in info['name'].lower()):
+            return info['name'], info['code']
+    
+    return None, None
 
 def escape_html(text):
     """Escape karakter khusus HTML"""
@@ -79,366 +115,530 @@ def escape_html(text):
     }
     return ''.join(escape_chars.get(char, char) for char in str(text))
 
-def main_menu_keyboard():
-    """Keyboard menu utama dengan tombol MENU di sebelah kiri"""
-    return ReplyKeyboardMarkup([
-        ['📝 Buat Pengaduan', '🔍 Cek Status'],
-        ['ℹ️ Bantuan', 'MENU']
-    ], resize_keyboard=True)
+def get_user_contact_info(user):
+    """Dapatkan informasi kontak user dengan handle username yang tidak ada"""
+    user_id = user.id
+    username = user.username
+    first_name = escape_html(user.first_name or "")
+    last_name = escape_html(user.last_name or "")
+    
+    # Format nama lengkap
+    full_name = f"{first_name} {last_name}".strip()
+    if not full_name:
+        full_name = "Tidak ada nama"
+    
+    # Format info kontak
+    if username:
+        contact_info = f"@{username}"
+        contact_method = "Username"
+    else:
+        contact_info = f"ID: {user_id}"
+        contact_method = "User ID"
+    
+    return {
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
+        "contact_info": contact_info,
+        "contact_method": contact_method
+    }
 
-def cancel_keyboard():
-    """Keyboard untuk pembatalan dengan tombol MENU"""
-    return ReplyKeyboardMarkup([
-        ['❌ Batalkan', 'MENU']
-    ], resize_keyboard=True)
-
-# ===== STATE MANAGEMENT =====
+# ===== STATE MANAGEMENT YANG DIPERBAIKI =====
 user_states = {}
-user_website_history = {}  # Untuk melacak website yang pernah digunakan user
+user_locks = {}  # Lock untuk setiap user
+
+def get_user_lock(user_id):
+    """Dapatkan lock untuk user tertentu"""
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
 
 def get_user_state(user_id):
-    """Dapatkan state user dengan default values"""
+    """Dapatkan state user dengan default values - THREAD SAFE"""
     if user_id not in user_states:
         user_states[user_id] = {
             "mode": None,
             "step": None,
-            "data": {}
+            "data": {},
+            "last_activity": datetime.now()
         }
     return user_states[user_id]
 
 def clear_user_state(user_id):
-    """Clear state user"""
+    """Clear state user - THREAD SAFE"""
     if user_id in user_states:
         del user_states[user_id]
+    if user_id in user_locks:
+        del user_locks[user_id]
 
-def update_user_website_history(user_id, website_name):
-    """Update history website user"""
-    user_website_history[user_id] = website_name
+def update_user_activity(user_id):
+    """Update waktu aktivitas terakhir user"""
+    if user_id in user_states:
+        user_states[user_id]["last_activity"] = datetime.now()
+
+# ===== MENU BUTTON HANDLERS =====
+async def setup_menu_button(application: Application):
+    """Setup menu button untuk semua user"""
+    try:
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonCommands()
+        )
+        logger.info("✅ Menu button commands berhasil diatur")
+    except Exception as e:
+        logger.error(f"❌ Gagal mengatur menu button: {e}")
+
+async def set_commands_menu(application: Application):
+    """Set daftar commands yang akan muncul di menu button"""
+    commands = [
+        ("start", "Mulai bot dan tampilkan menu utama"),
+        ("buat_pengaduan", "Buat pengaduan baru"),
+        ("cek_status", "Cek status tiket pengaduan"),
+        ("bantuan", "Tampilkan bantuan penggunaan"),
+        ("cancel", "Batalkan proses saat ini")
+    ]
+    
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("✅ Menu commands berhasil diatur")
+    except Exception as e:
+        logger.error(f"❌ Gagal mengatur menu commands: {e}")
+
+# ===== POST INIT FUNCTION =====
+async def post_init(application: Application):
+    """Setup setelah bot diinisialisasi"""
+    await set_commands_menu(application)
+    await setup_menu_button(application)
 
 # ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - reset semua state dan tampilkan menu"""
     user_id = update.message.from_user.id
-    clear_user_state(user_id)
     
-    await update.message.reply_text(
-        "🤖 <b>Selamat datang di Layanan Pengaduan</b>\n\n"
-        "Kami siap untuk melayani pengaduan anda.\n\n"
-        "Silakan pilih menu di bawah:",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+    async with get_user_lock(user_id):
+        clear_user_state(user_id)
+        user_state = get_user_state(user_id)
+        user_state["mode"] = "menu"
+        update_user_activity(user_id)
+    
+    welcome_text = (
+        "🎉 <b>Selamat datang di Layanan Pengaduan Customer Service!</b>\n\n"
+        "Kami siap membantu menyelesaikan masalah Anda.\n\n"
+        "👇 <b>Silakan pilih menu di bawah:</b>"
     )
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk tombol MENU - kembali ke menu utama"""
-    user_id = update.message.from_user.id
-    clear_user_state(user_id)
     
     await update.message.reply_text(
-        "📱 <b>Menu Utama</b>\n\n"
-        "Silakan pilih opsi yang Anda butuhkan:",
+        welcome_text,
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
 async def handle_buat_pengaduan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Memulai pengaduan baru - LANGSUNG MULAI DENGAN NAMA WEBSITE"""
+    """Memulai pengaduan baru - VALIDASI WEBSITE INPUT"""
     user_id = update.message.from_user.id
-    clear_user_state(user_id)
-    user_state = get_user_state(user_id)
-    user_state["mode"] = "pengaduan"
-    user_state["step"] = "nama_website"
+    
+    async with get_user_lock(user_id):
+        clear_user_state(user_id)
+        user_state = get_user_state(user_id)
+        user_state["mode"] = "pengaduan"
+        user_state["step"] = "nama_website"
+        update_user_activity(user_id)
     
     await update.message.reply_text(
         "📝 <b>Membuat Pengaduan Baru</b>\n\n"
-        "Silakan tulis <b>nama website</b> yang ingin Anda laporkan:\n\n"
-        "Ketik ❌ Batalkan untuk membatalkan",
+        "Silakan tulis <b>nama website</b> tempat Anda mengalami masalah:\n\n"
+        "✍️ <b>Tulis nama website:</b>",
         parse_mode="HTML",
-        reply_markup=cancel_keyboard()
+        reply_markup=get_cancel_only_keyboard()
     )
 
 async def handle_cek_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cek status tiket"""
+    """Cek status tiket - DIPISAHKAN DARI STATE PENGADUAN"""
     user_id = update.message.from_user.id
-    clear_user_state(user_id)
-    user_state = get_user_state(user_id)
-    user_state["mode"] = "cek_status"
-    user_state["step"] = "input_tiket"
     
-    # Berikan contoh tiket berdasarkan website history user jika ada
-    example_ticket = ""
-    if user_id in user_website_history:
-        website_name = user_website_history[user_id]
-        website_code = None
-        for key, info in WEBSITES.items():
-            if info['name'] == website_name:
-                website_code = info['code']
-                break
-        
-        if website_code:
-            example_ticket = f"\n<b>Contoh:</b> <code>{website_code}-31102025-001</code>"
+    async with get_user_lock(user_id):
+        clear_user_state(user_id)
+        user_state = get_user_state(user_id)
+        user_state["mode"] = "cek_status"
+        user_state["step"] = "input_tiket"
+        update_user_activity(user_id)
     
     await update.message.reply_text(
-        f"🔍 <b>Cek Status Tiket</b>\n\n"
-        f"Silakan kirim <b>Nomor Tiket</b> Anda:{example_ticket}\n\n"
-        "Ketik ❌ Batalkan untuk membatalkan",
+        "🔍 <b>Cek Status Tiket Pengaduan</b>\n\n"
+        "Silakan masukkan <b>Nomor Tiket</b> yang Anda terima:\n\n"
+        "🎫 <b>Format tiket:</b> <code>KODE-TANGGAL-NOMOR</code>\n\n"
+        "✍️ <b>Ketik nomor tiket Anda:</b>",
         parse_mode="HTML",
-        reply_markup=cancel_keyboard()
+        reply_markup=get_cancel_only_keyboard()
     )
 
 async def handle_bantuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu bantuan - DISEDERHANAKAN"""
-    await update.message.reply_text(
-        "ℹ️ <b>Bantuan Penggunaan</b>\n\n"
-        "📝 <b>Cara Buat Pengaduan:</b>\n"
-        "1. Klik '📝 Buat Pengaduan'\n"
-        "2. Tulis nama website\n"
-        "3. Isi nama lengkap\n"
-        "4. Isi username website\n"
-        "5. Jelaskan keluhan\n"
-        "6. Kirim bukti (opsional)\n\n"
-        "🔍 <b>Cek Status:</b>\n"
-        "1. Klik '🔍 Cek Status'\n"
-        "2. Masukkan nomor tiket\n\n"
-        "💡 <b>Tips:</b>\n"
+    """Menu bantuan"""
+    user_id = update.message.from_user.id
+    user_info = get_user_contact_info(update.message.from_user)
+    
+    help_text = (
+        "🆘 <b>Pusat Bantuan Customer Service</b>\n\n"
+        
+        "📋 <b>CARA BUAT PENGADUAN:</b>\n"
+        "1. Pilih <b>📝 Buat Pengaduan Baru</b>\n"
+        "2. Tulis <b>nama website</b> yang bermasalah\n"
+        "3. Isi <b>nama lengkap</b> Anda\n" 
+        "4. Masukkan <b>username/ID</b> di website tersebut\n"
+        "5. Jelaskan <b>keluhan</b> secara detail\n"
+        "6. Kirim <b>foto bukti</b> (jika ada)\n\n"
+        
+        "🔍 <b>CEK STATUS PENGADUAN:</b>\n"
+        "1. Pilih <b>🔍 Cek Status Tiket</b>\n"
+        "2. Masukkan <b>nomor tiket</b> yang diterima\n"
+        "3. Lihat status terbaru pengaduan\n\n"
+        
+        "💡 <b>INFORMASI PENTING:</b>\n"
+        "• Proses cepat & profesional\n"
+        "• Tim support siap membantu\n"
         "• Simpan nomor tiket dengan baik\n"
-        "• Bisa buat pengaduan berkali-kali\n\n"
-        "❌ <b>Batalkan proses kapan saja</b> dengan klik '❌ Batalkan'\n"
-        "📱 <b>Kembali ke menu utama</b> dengan klik 'MENU'",
+        
+        "❓ <b>MASIH BINGUNG?</b>\n"
+        "Gunakan tombol <b>📝 Buat Pengaduan Baru</b> untuk memulai!"
+    )
+    
+    await update.message.reply_text(
+        help_text,
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle cancel dari button"""
+    """Handle cancel dari command atau tombol"""
     user_id = update.message.from_user.id
-    clear_user_state(user_id)
+    
+    async with get_user_lock(user_id):
+        clear_user_state(user_id)
+        user_state = get_user_state(user_id)
+        user_state["mode"] = "menu"
+        update_user_activity(user_id)
     
     await update.message.reply_text(
         "❌ <b>Proses dibatalkan</b>\n\n"
-        "Kembali ke menu utama.",
+        "Kembali ke menu utama.\n\n"
+        "Silakan pilih menu yang diinginkan:",
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle semua pesan text dengan state management yang lebih baik"""
+    """Handle semua pesan text dengan state management yang DIPERBAIKI"""
     user_message = update.message.text.strip()
     user_id = update.message.from_user.id
     
-    user_state = get_user_state(user_id)
-    logger.info(f"User {user_id} message: {user_message}, state: {user_state}")
-    
-    # Handle MENU terlebih dahulu (selalu kembali ke menu utama)
-    if user_message == "MENU":
-        await handle_menu(update, context)
+    # Handle tombol navigasi utama - TANPA LOCK (hanya read)
+    if user_message in ["📝 Buat Pengaduan Baru", "/buat_pengaduan"]:
+        await handle_buat_pengaduan(update, context)
         return
-    
-    # Handle cancel terlebih dahulu
-    if user_message.lower() == "❌ batalkan":
+    elif user_message in ["🔍 Cek Status Tiket", "/cek_status"]:
+        await handle_cek_status(update, context)
+        return
+    elif user_message in ["ℹ️ Cara Penggunaan", "🆘 Bantuan", "/bantuan", "/help"]:
+        await handle_bantuan(update, context)
+        return
+    elif user_message in ["❌ Batalkan Proses", "/cancel", "cancel", "batal"]:
         await handle_cancel(update, context)
         return
     
-    # Handle menu utama
-    if not user_state["mode"]:
-        if user_message == "📝 Buat Pengaduan":
-            await handle_buat_pengaduan(update, context)
-            return
-        elif user_message == "🔍 Cek Status":
-            await handle_cek_status(update, context)
-            return
-        elif user_message == "ℹ️ Bantuan":
-            await handle_bantuan(update, context)
-            return
-        else:
-            await show_menu(update, context)
-            return
+    # Handle tombol konfirmasi bukti - PERBAIKAN DI SINI
+    if user_message in ["📸 Kirim Foto Bukti", "⏩ Lewati Tanpa Foto"]:
+        await handle_bukti_selection(update, context, user_message, user_id)
+        return
     
-    # Handle berdasarkan mode
-    mode = user_state["mode"]
-    step = user_state.get("step", "")
+    # Dapatkan state user dengan lock
+    async with get_user_lock(user_id):
+        user_state = get_user_state(user_id)
+        mode = user_state.get("mode")
+        step = user_state.get("step")
+        update_user_activity(user_id)
     
+    logger.info(f"User {user_id} message: {user_message}, mode: {mode}, step: {step}")
+    
+    # Handle berdasarkan mode dengan lock yang sesuai
     if mode == "pengaduan":
-        await handle_pengaduan_flow(update, context, user_message, user_state)
+        await handle_pengaduan_flow(update, context, user_message, user_id)
     elif mode == "cek_status" and step == "input_tiket":
-        await proses_cek_status(update, context, user_message, user_state)
+        await proses_cek_status(update, context, user_message, user_id)
     else:
-        logger.warning(f"Unknown state for user {user_id}: {user_state}")
-        clear_user_state(user_id)
+        logger.warning(f"Unknown state for user {user_id}: mode={mode}, step={step}")
+        async with get_user_lock(user_id):
+            clear_user_state(user_id)
         await show_menu(update, context)
 
-async def handle_pengaduan_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str, user_state: dict):
-    """Handle flow pengaduan yang lebih robust"""
-    step = user_state.get("step", "")
-    user_id = update.message.from_user.id
+async def handle_bukti_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, selection: str, user_id: int):
+    """Handle pemilihan opsi bukti - VERSI DIPERBAIKI"""
+    logger.info(f"Handling bukti selection for user {user_id}: {selection}")
+    
+    if selection == "📸 Kirim Foto Bukti":
+        await update.message.reply_text(
+            "📸 <b>Silakan kirim foto bukti sekarang:</b>\n\n"
+            "📎 <b>Unggah foto dari galeri Anda...</b>",
+            parse_mode="HTML",
+            reply_markup=get_cancel_only_keyboard()
+        )
+    elif selection == "⏩ Lewati Tanpa Foto":
+        # PERBAIKAN: Update state sebelum melanjutkan
+        async with get_user_lock(user_id):
+            user_state = get_user_state(user_id)
+            user_state["data"]["bukti"] = "Tidak ada bukti foto"
+            user_state["step"] = "completed"  # Mark as completed to prevent stuck
+            update_user_activity(user_id)
+            logger.info(f"User {user_id} memilih tanpa foto, state updated")
+        
+        await update.message.reply_text(
+            "⏩ <b>Melanjutkan tanpa foto bukti...</b>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # Beri sedikit delay untuk memastikan state tersimpan
+        await asyncio.sleep(1)
+        
+        await selesaikan_pengaduan(update, context, user_id)
+
+async def handle_pengaduan_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str, user_id: int):
+    """Handle flow pengaduan - DENGAN LOCK MANAGEMENT"""
+    async with get_user_lock(user_id):
+        user_state = get_user_state(user_id)
+        step = user_state.get("step", "")
+        update_user_activity(user_id)
+    
+    logger.info(f"Pengaduan flow for user {user_id}, step: {step}")
     
     if step == "nama_website":
-        # Cari website berdasarkan input user (case insensitive)
-        website_found = None
-        website_code = None
+        # VALIDASI INPUT WEBSITE
+        website_name, website_code = validate_website_input(user_message)
         
-        for key, info in WEBSITES.items():
-            if user_message.lower() in [key.lower(), info['name'].lower()]:
-                website_found = info['name']
-                website_code = info['code']
-                break
-        
-        if website_found:
-            # Update website history
-            update_user_website_history(user_id, website_found)
-            
-            user_state["data"]["website_name"] = website_found
-            user_state["data"]["website_code"] = website_code
-            user_state["step"] = "nama"
+        if website_name and website_code:
+            # Website valid, lanjutkan
+            async with get_user_lock(user_id):
+                user_state["data"]["website_name"] = website_name
+                user_state["data"]["website_code"] = website_code
+                user_state["step"] = "nama"
+                update_user_activity(user_id)
             
             await update.message.reply_text(
-                f"<b>{website_found}</b>\n\n"
+                f"<b>{website_name}</b>\n\n"
                 "Silakan kirim <b>Nama Lengkap</b> Anda:\n\n"
-                "Ketik ❌ Batalkan untuk membatalkan",
+                "✍️ <b>Ketik nama lengkap:</b>",
                 parse_mode="HTML",
-                reply_markup=cancel_keyboard()
+                reply_markup=get_cancel_only_keyboard()
             )
         else:
+            # Website tidak valid, minta input ulang
             await update.message.reply_text(
-                "❌ <b>Website tidak dikenali!</b>\n\n"
-                "Silakan tulis kembali nama website:",
+                "❌ <b>Website tidak valid!</b>\n\n"
+                "Silakan tulis <b>nama website</b> yang sesuai:\n\n"
+                "✍️ <b>Tulis nama website yang benar:</b>",
                 parse_mode="HTML",
-                reply_markup=cancel_keyboard()
+                reply_markup=get_cancel_only_keyboard()
             )
         
     elif step == "nama":
-        user_state["data"]["nama"] = user_message
-        user_state["data"]["user_id"] = update.message.from_user.id
-        user_state["data"]["username_tg"] = update.message.from_user.username or "-"
-        user_state["step"] = "username_website"
+        # Dapatkan info user untuk disimpan
+        user_info = get_user_contact_info(update.message.from_user)
+        
+        async with get_user_lock(user_id):
+            user_state["data"]["nama"] = user_message
+            user_state["data"]["user_id"] = user_info["user_id"]
+            user_state["data"]["username_tg"] = user_info["contact_info"]
+            user_state["data"]["contact_method"] = user_info["contact_method"]
+            user_state["data"]["full_name_tg"] = user_info["full_name"]
+            user_state["step"] = "username_website"
+            update_user_activity(user_id)
         
         website_name = user_state["data"]["website_name"]
         
         await update.message.reply_text(
-            f"🆔 <b>Masukkan Username / ID {website_name} Anda:</b>\n\n"
-            "Ketik ❌ Batalkan untuk membatalkan",
+            f"🆔 <b>Masukkan Username / ID Anda di {website_name}:</b>\n\n"
+            "✍️ <b>Ketik username atau ID Anda:</b>",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard()
+            reply_markup=get_cancel_only_keyboard()
         )
         
     elif step == "username_website":
-        user_state["data"]["username_website"] = user_message
-        user_state["step"] = "keluhan"
+        async with get_user_lock(user_id):
+            user_state["data"]["username_website"] = user_message
+            user_state["step"] = "keluhan"
+            update_user_activity(user_id)
         
         await update.message.reply_text(
-            "📋 <b>Jelaskan keluhan Anda:</b>\n\n"
-            "Ketik ❌ Batalkan untuk membatalkan",
+            "📋 <b>Jelaskan keluhan Anda secara detail:</b>\n\n"
+            "✍️ <b>Ketik penjelasan keluhan:</b>",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard()
+            reply_markup=get_cancel_only_keyboard()
         )
         
     elif step == "keluhan":
-        user_state["data"]["keluhan"] = user_message
-        user_state["step"] = "bukti"
+        async with get_user_lock(user_id):
+            user_state["data"]["keluhan"] = user_message
+            user_state["step"] = "bukti"
+            update_user_activity(user_id)
         
         await update.message.reply_text(
-            "📸 <b>Kirim foto bukti (opsional)</b>\n\n"
-            "Kirim foto sekarang atau ketik 'lanjut' untuk melanjutkan tanpa bukti.\n\n"
-            "Ketik ❌ Batalkan untuk membatalkan",
+            "📸 <b>Bukti Pendukung (Opsional)</b>\n\n"
+            "Pilih opsi untuk bukti:\n\n"
+            "• 📸 Kirim Foto Bukti - Unggah foto/screenshot\n"
+            "• ⏩ Lewati Tanpa Foto - Lanjut tanpa bukti\n\n"
+            "💡 <b>Rekomendasi:</b> Foto bukti membantu proses penyelesaian lebih cepat!",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard()
+            reply_markup=get_skip_photo_keyboard()
         )
-        
-    elif step == "bukti" and user_message.lower() == "lanjut":
-        user_state["data"]["bukti"] = "Tidak ada"
-        await selesaikan_pengaduan(update, context, user_state)
-        
-    elif step == "bukti":
+    
+    else:
+        logger.warning(f"Unexpected step for user {user_id}: {step}")
         await update.message.reply_text(
-            "❌ <b>Perintah tidak dikenali</b>\n\n"
-            "Untuk melanjutkan tanpa bukti, ketik: <b>lanjut</b>\n"
-            "Atau kirim foto sebagai bukti.\n\n"
-            "Ketik ❌ Batalkan untuk membatalkan",
+            "❌ <b>Terjadi error dalam proses.</b>\n\n"
+            "Silakan mulai kembali dengan memilih menu di bawah:",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard()
+            reply_markup=get_main_menu_keyboard()
         )
+        async with get_user_lock(user_id):
+            clear_user_state(user_id)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo untuk bukti"""
+    """Handle photo untuk bukti - VERSI DIPERBAIKI"""
     user_id = update.message.from_user.id
-    user_state = get_user_state(user_id)
     
-    mode = user_state.get("mode")
-    step = user_state.get("step")
+    async with get_user_lock(user_id):
+        user_state = get_user_state(user_id)
+        mode = user_state.get("mode")
+        step = user_state.get("step")
+        update_user_activity(user_id)
+    
+    logger.info(f"Photo received from user {user_id}, mode: {mode}, step: {step}")
     
     if mode == "pengaduan" and step == "bukti":
-        file_id = update.message.photo[-1].file_id
-        file_obj = await context.bot.get_file(file_id)
-        user_state["data"]["bukti"] = file_obj.file_path
-        
-        await update.message.reply_text(
-            "📸 <b>Foto bukti diterima!</b>\n\n"
-            "Sedang menyimpan pengaduan...",
-            parse_mode="HTML"
-        )
-        
-        await selesaikan_pengaduan(update, context, user_state)
+        try:
+            file_id = update.message.photo[-1].file_id
+            file_obj = await context.bot.get_file(file_id)
+            
+            async with get_user_lock(user_id):
+                user_state["data"]["bukti"] = file_obj.file_path
+                user_state["step"] = "completed"  # Mark as completed
+                update_user_activity(user_id)
+                logger.info(f"Photo saved for user {user_id}, file_path: {file_obj.file_path}")
+            
+            await update.message.reply_text(
+                "✅ <b>Foto bukti berhasil diterima!</b>\n\n"
+                "🔄 <b>Menyimpan pengaduan Anda...</b>",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            
+            # Beri sedikit delay untuk memastikan state tersimpan
+            await asyncio.sleep(1)
+            
+            await selesaikan_pengaduan(update, context, user_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing photo for user {user_id}: {e}")
+            await update.message.reply_text(
+                "❌ <b>Gagal memproses foto.</b>\n\n"
+                "Silakan coba lagi atau pilih '⏩ Lewati Tanpa Foto'.",
+                parse_mode="HTML",
+                reply_markup=get_skip_photo_keyboard()
+            )
     else:
         await update.message.reply_text(
-            "❌ Foto tidak diperlukan saat ini.",
-            reply_markup=main_menu_keyboard()
+            "❌ Foto tidak diperlukan saat ini.\n\nSilakan pilih menu yang sesuai:",
+            reply_markup=get_main_menu_keyboard()
         )
 
-async def selesaikan_pengaduan(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: dict):
-    """Selesaikan pengaduan dan simpan ke Google Sheets"""
-    user_id = update.message.from_user.id
-    data = user_state["data"]
+async def selesaikan_pengaduan(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Selesaikan pengaduan dan simpan ke Google Sheets - VERSI DIPERBAIKI"""
+    logger.info(f"Starting selesaikan_pengaduan for user {user_id}")
+    
+    # Ambil data dengan lock
+    async with get_user_lock(user_id):
+        user_state = get_user_state(user_id)
+        if not user_state.get("data"):
+            logger.error(f"No data found for user {user_id}")
+            await update.message.reply_text(
+                "❌ <b>Data pengaduan tidak ditemukan.</b>\n\n"
+                "Silakan mulai kembali dari menu utama.",
+                parse_mode="HTML",
+                reply_markup=get_main_menu_keyboard()
+            )
+            clear_user_state(user_id)
+            return
+            
+        data = user_state["data"].copy()  # Copy data untuk menghindari race condition
+        update_user_activity(user_id)
+        logger.info(f"Data retrieved for user {user_id}: {list(data.keys())}")
+    
     timestamp = get_jakarta_time()
+    
+    # Generate ticket number berdasarkan kode website yang valid
     website_code = data["website_code"]
     ticket_id = generate_ticket_number(website_code)
     
     logger.info(f"Processing new complaint from user {user_id}: {ticket_id}")
     
     try:
-        # Save to Google Sheets dengan kolom tambahan
+        # Save to Google Sheets
         worksheet.append_row([
-            timestamp,                           # Timestamp (DD/MM/YYYY HH:MM:SS)
-            ticket_id,                           # Ticket ID (CODE-DDMMYYYY-NOMOR)
-            data["website_name"],                # Nama Website
+            timestamp,                           # Timestamp
+            ticket_id,                           # Ticket ID
+            data["website_name"],                # Website Name (yang sudah divalidasi)
             data["nama"],                        # Nama
             data["username_website"],            # Username Website  
             data["keluhan"],                     # Keluhan
-            data.get("bukti", "Tidak ada"),      # Bukti
-            data["username_tg"],                 # Username_TG
+            data.get("bukti", "Tidak ada bukti foto"), # Bukti
+            data["username_tg"],                 # Username_TG atau User ID
             data["user_id"],                     # User_ID
+            data.get("contact_method", "User ID"), # Contact Method
+            data.get("full_name_tg", ""),        # Full Name Telegram
             "Sedang diproses"                    # Status
         ])
         logger.info(f"✅ Data saved to Google Sheets: {ticket_id}")
     except Exception as e:
         logger.error(f"❌ Failed to save to Google Sheets: {e}")
         await update.message.reply_text(
-            "❌ Maaf, terjadi gangguan sistem. Silakan coba lagi nanti.",
-            reply_markup=main_menu_keyboard()
+            "❌ Maaf, terjadi gangguan sistem. Silakan coba lagi nanti.\n\nSilakan pilih menu:",
+            reply_markup=get_main_menu_keyboard()
         )
-        clear_user_state(user_id)
+        async with get_user_lock(user_id):
+            clear_user_state(user_id)
         return
 
-    website_name = data["website_name"]
+    # Dapatkan info user untuk success message
+    user_info = get_user_contact_info(update.message.from_user)
+    
+    # Success message dengan info kontak
+    success_message = (
+        f"🎉 <b>PENGADUAN BERHASIL DICATAT!</b>\n\n"
+        f"✅ <b>Terima kasih, {escape_html(data['nama'])}!</b>\n\n"
+        f"📋 <b>DETAIL PENGADUAN:</b>\n"
+        f"• 🌐 <b>Website:</b> {data['website_name']}\n"
+        f"• 🎫 <b>Nomor Tiket:</b> <code>{ticket_id}</code>\n"
+        f"• 📊 <b>Status:</b> Sedang diproses\n"
+        f"• ⏰ <b>Waktu:</b> {timestamp}\n"
+        f"• 👤 <b>ID Telegram Anda:</b> <code>{user_info['user_id']}</code>\n\n"
+        f"⚠️ <b>PENTING: SIMPAN INFORMASI INI!</b>\n"
+        f"• Nomor tiket: <code>{ticket_id}</code>\n"
+        f"• ID Telegram: <code>{user_info['user_id']}</code>\n\n"
+        f"🔍 <b>Cek Status:</b> Pilih <b>🔍 Cek Status Tiket</b>\n\n"
+        f"📞 <b>Tim kami akan segera menghubungi Anda!</b>\n"
+        f"Pastikan Telegram Anda aktif untuk notifikasi."
+    )
     
     await update.message.reply_text(
-        f"🎉 <b>Pengaduan Berhasil Dikirim!</b>\n\n"
-        f"✅ <b>Terima kasih, {escape_html(data['nama'])}!</b>\n\n"
-        f"<b>📋 Detail Pengaduan:</b>\n"
-        f"• <b>Website:</b> {website_name}\n"
-        f"• <b>Nomor Tiket:</b> <code>{ticket_id}</code>\n"
-        f"• <b>Status:</b> Sedang diproses\n"
-        f"• <b>Waktu:</b> {timestamp}\n\n"
-        f"<b>💡 Simpan nomor tiket ini!</b>\n"
-        f"Gunakan menu '🔍 Cek Status' untuk memantau perkembangan pengaduan.\n\n"
-        f"<b>🔄 Ingin buat pengaduan lagi?</b> Klik '📝 Buat Pengaduan'",
+        success_message,
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
-    # Notify admin dengan HTML parsing yang lebih aman
+    # Notify admin dengan info kontak yang lengkap
     await kirim_notifikasi_admin_with_retry(context, data, ticket_id, timestamp, user_id)
     
-    clear_user_state(user_id)
+    async with get_user_lock(user_id):
+        clear_user_state(user_id)
+        logger.info(f"Pengaduan completed and state cleared for user {user_id}")
 
 async def kirim_notifikasi_admin_with_retry(context, data, ticket_id, timestamp, user_id, retry_count=3):
     """Kirim notifikasi ke admin dengan retry mechanism"""
@@ -459,7 +659,7 @@ async def kirim_notifikasi_admin_with_retry(context, data, ticket_id, timestamp,
     logger.error(f"❌ All notification attempts failed for ticket {ticket_id}")
 
 async def kirim_notifikasi_admin(context, data, ticket_id, timestamp):
-    """Send notification to admin - FIXED VERSION WITH HTML"""
+    """Send notification to admin dengan info kontak lengkap"""
     try:
         # Escape data untuk HTML
         nama_escaped = escape_html(data.get("nama", ""))
@@ -467,29 +667,43 @@ async def kirim_notifikasi_admin(context, data, ticket_id, timestamp):
         keluhan_escaped = escape_html(data.get("keluhan", ""))
         username_tg_escaped = escape_html(data.get("username_tg", ""))
         user_id_escaped = escape_html(data.get("user_id", ""))
-        website_name_escaped = escape_html(data.get("website_name", ""))
+        website_escaped = escape_html(data.get("website_name", ""))
+        contact_method = data.get("contact_method", "User ID")
+        full_name_tg = escape_html(data.get("full_name_tg", ""))
         
-        bukti_text = data.get("bukti", "Tidak ada")
-        if bukti_text != "Tidak ada" and bukti_text.startswith("http"):
+        bukti_text = data.get("bukti", "Tidak ada bukti foto")
+        if bukti_text != "Tidak ada bukti foto" and bukti_text.startswith("http"):
             bukti_display = f'<a href="{bukti_text}">📎 Lihat Bukti</a>'
         else:
             bukti_display = escape_html(bukti_text)
         
-        # Buat message dengan HTML parsing yang lebih aman
+        # Buat message untuk admin dengan info kontak lengkap
         message = (
             f"🚨 <b>PENGADUAN BARU DITERIMA</b> 🚨\n\n"
             f"🎫 <b>Ticket ID:</b> <code>{ticket_id}</code>\n"
-            f"🌐 <b>Website:</b> {website_name_escaped}\n"
+            f"🌐 <b>Website:</b> {website_escaped}\n"
             f"⏰ <b>Waktu:</b> {timestamp} (WIB)\n\n"
-            f"<b>📋 Data Pelapor:</b>\n"
-            f"• <b>Nama:</b> {nama_escaped}\n"
-            f"• <b>Username {website_name_escaped}:</b> {username_website_escaped}\n"
-            f"• <b>Telegram:</b> @{username_tg_escaped}\n"
+            f"<b>📋 DATA PELAPOR:</b>\n"
+            f"• <b>Nama Lengkap:</b> {nama_escaped}\n"
+            f"• <b>Username {website_escaped}:</b> {username_website_escaped}\n"
+            f"• <b>Nama Telegram:</b> {full_name_tg}\n"
+            f"• <b>Kontak Telegram:</b> {username_tg_escaped}\n"
+            f"• <b>Metode Kontak:</b> {contact_method}\n"
             f"• <b>User ID:</b> <code>{user_id_escaped}</code>\n\n"
-            f"<b>📝 Keluhan:</b>\n{keluhan_escaped}\n\n"
-            f"<b>📎 Bukti:</b> {bukti_display}\n\n"
-            f"⚠️ <b>Segera tindak lanjuti pengaduan ini!</b>"
+            f"<b>📝 KELUHAN:</b>\n{keluhan_escaped}\n\n"
+            f"<b>📎 BUKTI:</b> {bukti_display}\n\n"
+            f"<b>📞 CARA HUBUNGI:</b>\n"
         )
+        
+        # Tambahkan instruksi berdasarkan metode kontak
+        if "Username" in contact_method:
+            message += f"• Gunakan: <b>{username_tg_escaped}</b>\n"
+            message += f"• Atau User ID: <code>{user_id_escaped}</code>\n\n"
+        else:
+            message += f"• Gunakan User ID: <code>{user_id_escaped}</code>\n"
+            message += "• User tanpa username, gunakan ID untuk direct message\n\n"
+        
+        message += "⚠️ <b>Segera hubungi dan tindak lanjuti pengaduan ini!</b>"
         
         success_count = 0
         for admin_id in ADMIN_IDS:
@@ -512,9 +726,9 @@ async def kirim_notifikasi_admin(context, data, ticket_id, timestamp):
         logger.error(f"❌ Error in kirim_notifikasi_admin: {e}")
         return False
 
-async def proses_cek_status(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_id: str, user_state: dict):
-    """Proses cek status tiket - DIPERBAIKI UNTUK WEBSITE"""
-    current_user_id = update.message.from_user.id
+async def proses_cek_status(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_id: str, user_id: int):
+    """Proses cek status tiket - TERPISAH DARI STATE PENGADUAN"""
+    current_user_id = user_id
     
     try:
         all_data = worksheet.get_all_records()
@@ -555,63 +769,58 @@ async def proses_cek_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"🆔 <b>Username:</b> {username_escaped}\n"
                 f"💬 <b>Keluhan:</b> {keluhan_escaped}\n"
                 f"⏰ <b>Waktu:</b> {timestamp_escaped}\n\n"
-                f"Terima kasih! 🙏"
+                f"Terima kasih telah menggunakan layanan kami! 🙏"
             )
             
             await update.message.reply_text(
                 status_message,
                 parse_mode="HTML",
-                reply_markup=main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard()
             )
         else:
             await update.message.reply_text(
                 "❌ <b>Tiket tidak ditemukan.</b>\n\n"
                 "Pastikan:\n"
                 "• Nomor tiket benar\n"
-                "• Tidak ada typo\n\n"
-                "Klik '🔍 Cek Status' untuk mencoba lagi.",
+                "• Tidak ada typo\n"
+                "• Tiket milik Anda sendiri\n\n"
+                "Silakan coba lagi:",
                 parse_mode="HTML",
-                reply_markup=main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard()
             )
             
     except Exception as e:
         logger.error(f"Error checking status: {e}")
         await update.message.reply_text(
-            "❌ Terjadi error. Silakan coba lagi.",
-            reply_markup=main_menu_keyboard()
+            "❌ Terjadi error. Silakan coba lagi.\n\nSilakan pilih menu:",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard()
         )
     
-    clear_user_state(current_user_id)
+    async with get_user_lock(current_user_id):
+        clear_user_state(current_user_id)
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tampilkan menu utama"""
     await update.message.reply_text(
-        "🤖 <b>Layanan Pengaduan</b>\n\n"
-        "Kami siap melayani pengaduan Anda.\n\n"
-        "Silakan pilih menu:",
+        "🤖 <b>Layanan Pengaduan Customer Service</b>\n\n"
+        "Kami siap membantu masalah Anda.\n\n"
+        "👇 <b>Silakan pilih menu:</b>",
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard()
     )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel command"""
-    user_id = update.message.from_user.id
-    clear_user_state(user_id)
-    
-    await update.message.reply_text(
-        "❌ <b>Semua proses dibatalkan</b>\n\n"
-        "Kembali ke menu utama.",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
-    )
+    await handle_cancel(update, context)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle error"""
     logger.error(f"Error: {context.error}")
     if update and update.message:
         await update.message.reply_text(
-            "❌ Terjadi error, silakan coba lagi.",
-            reply_markup=main_menu_keyboard()
+            "❌ Terjadi error, silakan coba lagi.\n\nSilakan pilih menu:",
+            reply_markup=get_main_menu_keyboard()
         )
 
 def main():
@@ -629,25 +838,23 @@ def main():
         return
 
     try:
-        application = Application.builder().token(BOT_TOKEN).build()
+        application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
         
+        # Command handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("cancel", cancel_command))
         application.add_handler(CommandHandler("help", handle_bantuan))
-        application.add_handler(CommandHandler("menu", handle_menu))
+        application.add_handler(CommandHandler("buat_pengaduan", handle_buat_pengaduan))
+        application.add_handler(CommandHandler("cek_status", handle_cek_status))
+        application.add_handler(CommandHandler("bantuan", handle_bantuan))
         
-        application.add_handler(MessageHandler(filters.Text(["📝 Buat Pengaduan"]), handle_buat_pengaduan))
-        application.add_handler(MessageHandler(filters.Text(["🔍 Cek Status"]), handle_cek_status))
-        application.add_handler(MessageHandler(filters.Text(["ℹ️ Bantuan"]), handle_bantuan))
-        application.add_handler(MessageHandler(filters.Text(["MENU"]), handle_menu))
-        application.add_handler(MessageHandler(filters.Text(["❌ Batalkan"]), handle_cancel))
-        
+        # Message handlers
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
         application.add_error_handler(error_handler)
         
-        logger.info("✅ Complaint Bot starting...")
+        logger.info("✅ Enhanced Complaint Bot with Contact Info starting...")
         application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
